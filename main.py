@@ -9,6 +9,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 KLING_TOKEN = os.getenv("JWT_TOKEN")
 
+
+queue = asyncio.Queue()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -29,10 +31,23 @@ async def handle_input(message: types.Message):
     image_url = lines[0].strip()
     prompt = "\n".join(lines[1:]).strip()
 
-    await message.answer("🎬 Генерирую видео...")
+    # добавляем в очередь
+    await queue.put((message, image_url, prompt))
 
-    asyncio.create_task(generate_video(message, image_url, prompt))
+    position = queue.qsize()
+    await message.answer(f"⏳ Вы в очереди: {position}")
 
+async def worker():
+    while True:
+        message, image_url, prompt = await queue.get()
+
+        try:
+            await message.answer("🎬 Начинаю генерацию...")
+            await generate_video(message, image_url, prompt)
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
+        finally:
+            queue.task_done()
 
 async def image_url_to_base64(session, url: str):
     try:
@@ -78,7 +93,7 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
         "image": image_url,
         "prompt": prompt,
         "negative_prompt": "",
-        "duration": "10",
+        "duration": "5",
         "mode": "pro",
         "sound": "off",
         "callback_url": "",
@@ -162,6 +177,9 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
 
 # ▶️ запуск
 async def main():
+    # запускаем воркер
+    asyncio.create_task(worker())
+
     await dp.start_polling(bot)
 
 
