@@ -4,6 +4,9 @@ import os
 from aiogram import Bot, Dispatcher, types
 from dotenv import load_dotenv
 import base64
+import gc
+
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -114,7 +117,7 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
         ) as resp:
 
             raw_text = await resp.text()
-
+            del image_base64
             print("\n===== GENERATE RESPONSE =====")
             print("STATUS:", resp.status)
             print(raw_text[:2000])
@@ -171,9 +174,10 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
 
         try:
             await message.answer_video(video_url)
+            
         except:
             await message.answer(f"🎥 Видео:\n{video_url}")
-
+        gc.collect()
 
 # ▶️ запуск
 async def main():
