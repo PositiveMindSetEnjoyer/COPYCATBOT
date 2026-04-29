@@ -5,7 +5,10 @@ from aiogram import Bot, Dispatcher, types
 from dotenv import load_dotenv
 import base64
 import gc
+import logging
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
