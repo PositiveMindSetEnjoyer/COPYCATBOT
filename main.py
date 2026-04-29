@@ -3,7 +3,7 @@ import aiohttp
 import os
 from aiogram import Bot, Dispatcher, types
 from dotenv import load_dotenv
-
+import base64
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -34,6 +34,37 @@ async def handle_input(message: types.Message):
     asyncio.create_task(generate_video(message, image_url, prompt))
 
 
+async def image_url_to_base64(session, url: str):
+    try:
+        async with session.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+
+            if resp.status != 200:
+                print("❌ IMAGE STATUS:", resp.status)
+                return None
+
+            content_type = resp.headers.get("Content-Type", "")
+            if "image" not in content_type:
+                print("❌ NOT IMAGE:", content_type)
+                return None
+
+            data = await resp.read()
+
+            # защита от слишком больших файлов (~10MB)
+            if len(data) > 10 * 1024 * 1024:
+                print("❌ IMAGE TOO LARGE")
+                return None
+
+            return base64.b64encode(data).decode("utf-8")
+
+    except Exception as e:
+        print("❌ IMAGE LOAD ERROR:", e)
+        return None
+
+
 # 🚀 Генерация видео
 async def generate_video(message: types.Message, image_url: str, prompt: str):
 
@@ -47,7 +78,7 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
         "image": image_url,
         "prompt": prompt,
         "negative_prompt": "",
-        "duration": "5",
+        "duration": "10",
         "mode": "pro",
         "sound": "off",
         "callback_url": "",
@@ -55,7 +86,11 @@ async def generate_video(message: types.Message, image_url: str, prompt: str):
     }
 
     async with aiohttp.ClientSession() as session:
+        image_base64 = await image_url_to_base64(session, image_url)
 
+        if not image_base64:
+            await message.answer("❌ Не удалось загрузить изображение. Попробуй другую ссылку.")
+            return
         # 📤 создаём задачу
         async with session.post(
             "https://api-singapore.klingai.com/v1/videos/image2video",
