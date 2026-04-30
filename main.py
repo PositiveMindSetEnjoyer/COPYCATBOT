@@ -16,7 +16,7 @@ from keyjwt import encode_jwt_token
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 KLING_TOKEN = os.getenv('JWT_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '7238366804'))
 
 WORKERS = int(os.getenv('WORKERS', '3'))
 QUEUE_MAXSIZE = int(os.getenv('QUEUE_MAXSIZE', '100'))
