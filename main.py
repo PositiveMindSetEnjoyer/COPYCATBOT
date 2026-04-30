@@ -1,228 +1,238 @@
 import asyncio
-import aiohttp
-import os
 import base64
+import gc
 import logging
+import os
 import sys
+import time
+from contextlib import suppress
+from typing import Optional, Tuple
 
-from dotenv import load_dotenv
+import aiohttp
 from aiogram import Bot, Dispatcher, types
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.types import Message
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from dotenv import load_dotenv, set_key
+from keyjwt import encode_jwt_token
 
+# =========================
+# CONFIG
+# =========================
 load_dotenv()
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+KLING_TOKEN = os.getenv('JWT_TOKEN')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '7238366804'))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-KLING_TOKEN = os.getenv("JWT_TOKEN")
+WORKERS = int(os.getenv('WORKERS', '3'))
+QUEUE_ITEM_TTL = int(os.getenv('QUEUE_ITEM_TTL', '1800'))
+IDLE_CLEAN_INTERVAL = int(os.getenv('IDLE_CLEAN_INTERVAL', '300'))
+MAX_PROMPT_LEN = int(os.getenv('MAX_PROMPT_LEN', '4000'))
+QUEUE_MAXSIZE = int(os.getenv('QUEUE_MAXSIZE', '100'))
+REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '30'))
+IMAGE_TIMEOUT = int(os.getenv('IMAGE_TIMEOUT', '20'))
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '5'))
+MAX_POLL_ATTEMPTS = int(os.getenv('MAX_POLL_ATTEMPTS', '120'))
+MAX_IMAGE_MB = int(os.getenv('MAX_IMAGE_MB', '10'))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not KLING_TOKEN:
-    raise RuntimeError("JWT_TOKEN is missing")
+# =========================
+# LOGGING
+# =========================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(name)s | %(message)s')
+logger = logging.getLogger('video_bot')
 
-logging.basicConfig(
-    level=logging.INFO,
-    stream=sys.stdout,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("tg-bot")
-
-queue = asyncio.Queue()
+# =========================
+# APP
+# =========================
+queue: asyncio.Queue[Tuple[types.Message, str, str, float]] = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+http_session: Optional[aiohttp.ClientSession] = None
+admin_waiting = {}
+
+# =========================
+# HELPERS
+# =========================
+async def safe_send(message: types.Message, text: str, reply_markup=None):
+    with suppress(Exception):
+        await message.answer(text, reply_markup=reply_markup)
 
 
-@dp.message()
-async def log_all_messages(message: Message):
-    logger.info(
-        "UPDATE received | user_id=%s chat_id=%s text=%r",
-        message.from_user.id if message.from_user else None,
-        message.chat.id if message.chat else None,
-        message.text[:300] if message.text else None,
-    )
+async def trim_memory():
+    gc.collect()
 
-
-@dp.message(lambda message: message.text)
-async def handle_input(message: types.Message):
+async def image_url_to_base64(session: aiohttp.ClientSession, url: str) -> Optional[str]:
     try:
-        text = message.text.strip()
-        lines = text.split("\n")
-
-        if len(lines) < 2:
-            await message.answer(
-                "❌ Формат:\n\n"
-                "ссылка_на_картинку\nпромпт"
-            )
-            return
-
-        image_url = lines[0].strip()
-        prompt = "\n".join(lines[1:]).strip()
-
-        await queue.put((message.chat.id, message.from_user.id, image_url, prompt))
-        logger.info("Job queued | user_id=%s queue_size=%s", message.from_user.id, queue.qsize())
-
-        await message.answer(f"⏳ Вы в очереди: {queue.qsize()}")
-    except Exception:
-        logger.exception("handle_input failed")
-        await message.answer("❌ Внутренняя ошибка при обработке сообщения.")
-
-
-async def image_url_to_base64(session: aiohttp.ClientSession, url: str):
-    try:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with session.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=timeout,
-        ) as resp:
+        timeout = aiohttp.ClientTimeout(total=IMAGE_TIMEOUT)
+        async with session.get(url, timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'}) as resp:
             if resp.status != 200:
-                logger.warning("Image load bad status=%s url=%s", resp.status, url)
                 return None
-
-            content_type = resp.headers.get("Content-Type", "")
-            if "image" not in content_type:
-                logger.warning("Not an image | content_type=%s url=%s", content_type, url)
+            if 'image' not in resp.headers.get('Content-Type', '').lower():
                 return None
-
             data = await resp.read()
-
-            if len(data) > 10 * 1024 * 1024:
-                logger.warning("Image too large | size=%s url=%s", len(data), url)
+            if len(data) > MAX_IMAGE_MB * 1024 * 1024:
                 return None
-
-            return base64.b64encode(data).decode("utf-8")
+            return base64.b64encode(data).decode('utf-8')
     except Exception:
-        logger.exception("Image download/base64 failed | url=%s", url)
+        logger.exception('Image load failed')
         return None
 
-
-async def generate_video(session: aiohttp.ClientSession, chat_id: int, image_url: str, prompt: str):
-    headers = {
-        "Authorization": f"Bearer {KLING_TOKEN}",
-        "Content-Type": "application/json",
-    }
-
-    image_base64 = await image_url_to_base64(session, image_url)
-    if not image_base64:
-        await bot.send_message(chat_id, "❌ Не удалось загрузить изображение. Попробуй другую ссылку.")
-        return
-
+# =========================
+# KLING API
+# =========================
+async def create_task(session, image_b64, prompt):
+    global KLING_TOKEN
+    headers = {'Authorization': f'Bearer {KLING_TOKEN}', 'Content-Type': 'application/json'}
     payload = {
-        "model_name": "kling-v2-6",
-        "image": image_base64,
-        "prompt": prompt,
-        "negative_prompt": "",
-        "duration": "5",
-        "mode": "pro",
-        "sound": "off",
-        "callback_url": "",
-        "external_task_id": "",
+        'model_name': 'kling-v2-6',
+        'image': image_b64,
+        'prompt': prompt,
+        'negative_prompt': '',
+        'duration': '5',
+        'mode': 'pro',
+        'sound': 'off',
+        'callback_url': '',
+        'external_task_id': ''
     }
-
     try:
-        logger.info("Creating Kling task | chat_id=%s", chat_id)
-        timeout = aiohttp.ClientTimeout(total=60)
-
-        async with session.post(
-            "https://api-singapore.klingai.com/v1/videos/image2video",
-            json=payload,
-            headers=headers,
-            timeout=timeout,
-        ) as resp:
-            raw_text = await resp.text()
-            logger.info("Kling create response | status=%s body=%s", resp.status, raw_text[:1000])
-
-            try:
-                result = await resp.json()
-            except Exception:
-                await bot.send_message(chat_id, f"❌ Ошибка API:\n{raw_text[:1000]}")
-                return
-
-        if result.get("code") != 0:
-            await bot.send_message(chat_id, f"❌ Ошибка создания задачи:\n{result}")
-            return
-
-        task_id = result["data"]["task_id"]
-        logger.info("Task created | task_id=%s", task_id)
-
-        deadline = asyncio.get_event_loop().time() + 1800
-
-        while True:
-            if asyncio.get_event_loop().time() > deadline:
-                await bot.send_message(chat_id, "❌ Таймаут ожидания результата.")
-                return
-
-            await asyncio.sleep(5)
-
-            async with session.get(
-                f"https://api-singapore.klingai.com/v1/videos/image2video/{task_id}",
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                raw_text = await resp.text()
-                logger.info("Kling status response | status=%s body=%s", resp.status, raw_text[:1000])
-
-                try:
-                    status = await resp.json()
-                except Exception:
-                    await bot.send_message(chat_id, f"❌ Ошибка статуса:\n{raw_text[:1000]}")
-                    return
-
-            data = status.get("data", {})
-            state = data.get("task_status")
-            logger.info("Task status | task_id=%s state=%s", task_id, state)
-
-            if state == "succeed":
-                video_url = data["task_result"]["videos"][0]["url"]
-                break
-
-            if state in ["failed", "error"]:
-                await bot.send_message(chat_id, f"❌ Генерация провалилась:\n{status}")
-                return
-
-        await bot.send_message(chat_id, "✅ Готово!")
-
-        try:
-            await bot.send_video(chat_id, video_url)
-        except Exception:
-            logger.exception("send_video failed, fallback to text")
-            await bot.send_message(chat_id, f"🎥 Видео:\n{video_url}")
-
+        async with session.post('https://api-singapore.klingai.com/v1/videos/image2video', json=payload, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+            if data.get('code') == 0:
+                return data['data']['task_id']
     except Exception:
-        logger.exception("generate_video failed | chat_id=%s", chat_id)
-        await bot.send_message(chat_id, "❌ Внутренняя ошибка при генерации видео.")
+        logger.exception('Create task failed')
+    return None
 
-
-async def worker(session: aiohttp.ClientSession):
-    logger.info("Worker started")
-    while True:
-        chat_id, user_id, image_url, prompt = await queue.get()
-        logger.info("Worker picked job | user_id=%s queue_size=%s", user_id, queue.qsize())
-
+async def poll_task(session, task_id):
+    global KLING_TOKEN
+    headers = {'Authorization': f'Bearer {KLING_TOKEN}'}
+    for _ in range(MAX_POLL_ATTEMPTS):
+        await asyncio.sleep(POLL_INTERVAL)
         try:
-            await bot.send_message(chat_id, "🎬 Начинаю генерацию...")
-            await generate_video(session, chat_id, image_url, prompt)
+            async with session.get(f'https://api-singapore.klingai.com/v1/videos/image2video/{task_id}', headers=headers) as resp:
+                data = await resp.json(content_type=None)
+                state = data.get('data', {}).get('task_status')
+                if state == 'succeed':
+                    return data['data']['task_result']['videos'][0]['url']
+                if state in ('failed', 'error'):
+                    return None
         except Exception:
-            logger.exception("Worker job failed | user_id=%s", user_id)
-            try:
-                await bot.send_message(chat_id, "❌ Ошибка при обработке задания.")
-            except Exception:
-                logger.exception("Failed to notify user about job error")
+            logger.exception('Poll failed')
+    return None
+
+# =========================
+# BUSINESS
+# =========================
+async def generate_video(message, image_url, prompt):
+    image_b64 = await image_url_to_base64(http_session, image_url)
+    if not image_b64:
+        await safe_send(message, '❌ Не удалось загрузить изображение')
+        return
+    task_id = await create_task(http_session, image_b64, prompt)
+    del image_b64
+    await trim_memory()
+    if not task_id:
+        await safe_send(message, '❌ Ошибка создания задачи')
+        return
+    video = await poll_task(http_session, task_id)
+    if not video:
+        await safe_send(message, '❌ Генерация завершилась ошибкой')
+        return
+    try:
+        await message.answer_video(video)
+    except Exception:
+        await safe_send(message, video)
+
+async def queue_janitor():
+    while True:
+        await asyncio.sleep(IDLE_CLEAN_INTERVAL)
+        try:
+            fresh = []
+            now = time.time()
+            while not queue.empty():
+                item = queue.get_nowait()
+                if now - item[3] <= QUEUE_ITEM_TTL:
+                    fresh.append(item)
+                queue.task_done()
+            for item in fresh:
+                await queue.put(item)
+            await trim_memory()
+        except Exception:
+            logger.exception('Janitor error')
+
+async def worker(worker_id):
+    while True:
+        message, image_url, prompt, created = await queue.get()
+        try:
+            await generate_video(message, image_url, prompt)
+        except Exception:
+            logger.exception('Worker error')
         finally:
             queue.task_done()
-            logger.info("Worker finished job | user_id=%s", user_id)
 
+# =========================
+# HANDLERS
+# =========================
+@dp.message(lambda m: m.chat.id == ADMIN_ID and m.text == '/admin')
+async def admin_panel(message: types.Message):
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text='🔑 Обновить JWT')]], resize_keyboard=True)
+    await safe_send(message, 'Админ панель', kb)
 
+@dp.message(lambda m: m.chat.id == ADMIN_ID and m.text == '🔑 Обновить JWT')
+async def admin_jwt(message: types.Message):
+    admin_waiting[message.chat.id] = True
+    await safe_send(message, 'Отправьте данные:api_keysecret_key')
+
+@dp.message(lambda m: bool(m.text))
+async def handle_input(message: types.Message):
+    global KLING_TOKEN
+
+    if message.chat.id == ADMIN_ID and admin_waiting.get(message.chat.id):
+        parts = message.text.strip().split('\n')
+        if len(parts) < 2:
+            await safe_send(message, 'Формат:api_key secret_key')
+            return
+        try:
+            token = encode_jwt_token(parts[0].strip(), parts[1].strip())
+            KLING_TOKEN = token
+            set_key('.env', 'JWT_TOKEN', token)
+            admin_waiting.pop(message.chat.id, None)
+            await safe_send(message, '✅ JWT обновлен.', ReplyKeyboardRemove())
+            await asyncio.sleep(1)
+            return
+        except Exception:
+            logger.exception('JWT update error')
+            await safe_send(message, '❌ Ошибка обновления JWT')
+            return
+
+    text = message.text.strip()
+    lines = text.split('\n')
+    if len(lines) < 2:
+        await safe_send(message, '❌ Формат: ссылка_на_картинку промпт')
+        return
+    if queue.full():
+        await safe_send(message, '⛔ Очередь переполнена')
+        return
+    image_url = lines[0].strip()
+    prompt = ''.join(lines[1:]).strip()[:MAX_PROMPT_LEN]
+    await queue.put((message, image_url, prompt, time.time()))
+    await safe_send(message, f'⏳ Вы в очереди: {queue.qsize()}')
+
+# =========================
+# MAIN
+# =========================
 async def main():
-    logger.info("Bot starting")
-
-    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
-    timeout = aiohttp.ClientTimeout(total=None)
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        asyncio.create_task(worker(session))
+    global http_session
+    http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT), connector=aiohttp.TCPConnector(limit=100))
+    workers = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
+    janitor = asyncio.create_task(queue_janitor())
+    try:
         await dp.start_polling(bot)
+    finally:
+        janitor.cancel()
+        for w in workers:
+            w.cancel()
+        await asyncio.gather(*workers, janitor, return_exceptions=True)
+        await http_session.close()
+        await bot.session.close()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
