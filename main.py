@@ -233,7 +233,7 @@ async def handle_input(message: types.Message):
             await safe_send(message, '❌ Ошибка получения баланса')
             return
 
-        await safe_send(message, f'📊 Баланс:\n{data}', main_menu())
+        await safe_send(message, f' Остаток токенов на балансе:\n{data}', main_menu())
         return
     if uid in user_pending and user_pending[uid].get('state') == 'waiting_duration':
         if text not in ('5', '10'):
@@ -299,7 +299,7 @@ async def get_balance():
                     total += pack.get("total_quantity", 0)
                     remaining += pack.get("remaining_quantity", 0)
 
-            return total, remaining
+            return remaining
 
     except Exception:
         logger.exception("Balance request failed")
