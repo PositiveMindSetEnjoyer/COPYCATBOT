@@ -16,7 +16,7 @@ from keyjwt import encode_jwt_token
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 KLING_TOKEN = os.getenv('JWT_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '7238366804'))
+ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 
 WORKERS = int(os.getenv('WORKERS', '3'))
 QUEUE_MAXSIZE = int(os.getenv('QUEUE_MAXSIZE', '100'))
@@ -38,6 +38,7 @@ dp = Dispatcher()
 http_session: Optional[aiohttp.ClientSession] = None
 admin_waiting = {}
 user_pending = {}
+user_active_tasks = {}
 
 async def safe_send(message: types.Message, text: str, reply_markup=None):
     with suppress(Exception):
@@ -118,6 +119,19 @@ async def generate_video(message, image_url, prompt, duration):
         return
     try:
         await message.answer_video(video)
+        balance = await get_balance()
+
+        if not balance:
+            await safe_send(message, "📊 Баланс недоступен")
+        else:
+            total, remaining = balance
+            await safe_send(
+                message,
+                f"📊 Баланс:\n"
+                f"Всего: {total}\n"
+                f"Осталось: {remaining}\n"
+                f"Использовано: {total - remaining}"
+    )
     except Exception:
         await safe_send(message, video)
 
@@ -141,16 +155,20 @@ async def queue_janitor():
 async def worker(worker_id):
     while True:
         message, image_url, prompt, duration, created = await queue.get()
+        uid = message.chat.id
         try:
             await generate_video(message, image_url, prompt, duration)
         except Exception:
             logger.exception('Worker error')
         finally:
+            # decrement active tasks
+            user_active_tasks[uid] = max(0, user_active_tasks.get(uid, 1) - 1)
             queue.task_done()
 
 def main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text='🎬 Новый запрос')],
+        [KeyboardButton(text='📊 Баланс')],
         [KeyboardButton(text='❌ Отмена')]
     ], resize_keyboard=True)
 
@@ -175,7 +193,7 @@ async def admin_panel(message: types.Message):
 @dp.message(lambda m: m.chat.id == ADMIN_ID and m.text == '🔑 Обновить JWT')
 async def admin_jwt(message: types.Message):
     admin_waiting[message.chat.id] = True
-    await safe_send(message, 'Отправьте данные:api_keysecret_key')
+    await safe_send(message, 'Отправьте данные в формате : api_key \n  secret_key')
 
 @dp.message(lambda m: bool(m.text))
 async def handle_input(message: types.Message):
@@ -207,17 +225,31 @@ async def handle_input(message: types.Message):
     if text == '🎬 Новый запрос':
         user_pending[uid] = {'state': 'waiting_input'}
         asyncio.create_task(expire_request(uid))
-        await safe_send(message, 'Отправьте:ссылка_на_картинку промпт ⌛ У вас 30 секунд', main_menu())
+        await safe_send(message, 'Отправьте: ссылка_на_картинку \n промпт ⌛ У вас 30 секунд', main_menu())
         return
+    if text == '📊 Баланс':
+        data = await get_balance()
+        if not data:
+            await safe_send(message, '❌ Ошибка получения баланса')
+            return
 
+        await safe_send(message, f'📊 Баланс:\n{data}', main_menu())
+        return
     if uid in user_pending and user_pending[uid].get('state') == 'waiting_duration':
         if text not in ('5', '10'):
             await safe_send(message, 'Выберите кнопкой: 5 или 10 секунд')
             return
+        # per-user concurrency limit
+        if user_active_tasks.get(uid, 0) >= WORKERS:
+            await safe_send(message, '⛔ У вас уже максимум активных запросов. Подождите завершения.', main_menu())
+            user_pending.pop(uid, None)
+            return
         data = user_pending.pop(uid)
         if queue.full():
-            await safe_send(message, '⛔ Очередь переполнена', main_menu())
+            await safe_send(message, '⛔ Очередь заполнена, подождите', main_menu())
             return
+        # increment active tasks
+        user_active_tasks[uid] = user_active_tasks.get(uid, 0) + 1
         await queue.put((message, data['image_url'], data['prompt'], text, time.time()))
         await safe_send(message, f'⏳ Вы в очереди: {queue.qsize()}', main_menu())
         return
@@ -235,14 +267,49 @@ async def handle_input(message: types.Message):
         return
 
     await safe_send(message, 'Нажмите 🎬 Новый запрос', main_menu())
+async def get_balance():
+    global KLING_TOKEN
 
+    url = "https://api-singapore.klingai.com/account/costs"
+    headers = {
+        "Authorization": f"Bearer {KLING_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    params = {
+        "start_time": 0,
+        "end_time": int(time.time() * 1000),
+        "page": 1,
+        "page_size": 50
+    }
+
+    try:
+        async with http_session.get(url, headers=headers, params=params) as resp:
+            data = await resp.json(content_type=None)
+
+            packs = data.get("data", {}).get("resource_pack_subscribe_infos", [])
+
+            if not packs:
+                return None
+
+            total = 0
+            remaining = 0
+
+            for pack in packs:
+                if pack.get("status") == "online":
+                    total += pack.get("total_quantity", 0)
+                    remaining += pack.get("remaining_quantity", 0)
+
+            return total, remaining
+
+    except Exception:
+        logger.exception("Balance request failed")
+        return None
 async def main():
     global http_session
     http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT), connector=aiohttp.TCPConnector(limit=100))
     workers = [asyncio.create_task(worker(i)) for i in range(WORKERS)]
     janitor = asyncio.create_task(queue_janitor())
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         janitor.cancel()
